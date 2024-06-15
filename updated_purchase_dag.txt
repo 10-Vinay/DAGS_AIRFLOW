@@ -1,0 +1,286 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+import pandas as pd
+import os
+import glob
+import psycopg2
+import pytz
+import hashlib
+import sqlalchemy
+import pg8000
+from sqlalchemy import inspect, text
+from datetime import datetime, timedelta
+from configparser import ConfigParser
+from google.cloud.sql.connector import Connector, IPTypes
+from io import StringIO
+# Define the default arguments for the DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'start_date': days_ago(1),
+}
+
+# Define the DAG
+dag = DAG(
+    'updated_purchase',
+    default_args=default_args,
+    description='A DAG to process new CSV data and upload to PostgreSQL',
+    schedule_interval='@daily',
+    catchup=False,
+)
+
+csv_file_pattern = "/home/vishprospero/Docchoice/Updated_purchase_output.csv"   # Update this path
+
+def read_csv_file(**kwargs):
+    files = glob.glob(csv_file_pattern)
+    df_list = []
+    for file in files:
+        print("Reading file:", file)
+        df = pd.read_csv(file)
+        df_list.append(df)
+    df = pd.concat(df_list)
+    
+    # Reset index to ensure uniqueness
+    df.reset_index(drop=True, inplace=True)
+    
+    # Convert DataFrame to JSON and push to XCom
+    csv_data_json = df.to_json()
+    kwargs['ti'].xcom_push(key='csv_data', value=csv_data_json)
+
+def preprocess_csv_data(**kwargs):
+    ti = kwargs['ti']
+    csv_data_json = ti.xcom_pull(key='csv_data', task_ids='read_csv_file')
+    
+    # Read JSON string to DataFrame using StringIO to avoid FutureWarning
+    df = pd.read_json(StringIO(csv_data_json))
+    
+    if "#" in df.columns:
+        df.drop(columns=["#"], inplace=True)
+    
+    if 'Order Date' in df.columns:
+        df['Order Date'] = pd.to_datetime(df['Order Date'])
+    
+    if 'Expiry' in df.columns:
+        df['Expiry'] = pd.to_datetime(df['Expiry'], errors='coerce', format='%b-%Y')
+    
+    if 'Month_Year' in df.columns:
+        df['Month_Year'] = pd.to_datetime(df['Month_Year'], errors='coerce', format='%B-%Y')
+    
+    df['hash_id'] = df.apply(generate_hash_id, axis=1)
+
+    # Convert preprocessed DataFrame to JSON and push to XCom
+    preprocessed_data_json = df.to_json()
+    kwargs['ti'].xcom_push(key='preprocessed_data', value=preprocessed_data_json)
+
+def create_new_table(**kwargs):
+    engine = get_database_connection()
+    create_new_table_query = text("""
+    CREATE TABLE IF NOT EXISTS updated_purchase (
+        order_no VARCHAR,
+        invoice_no VARCHAR,
+        order_date DATE,
+        vendor VARCHAR,
+        manufacturer VARCHAR,
+        item_name VARCHAR,
+        batch_no VARCHAR,
+        expiry DATE,
+        purchase_qty INT,
+        units VARCHAR,
+        avl_qty INT,
+        units_1 VARCHAR,
+        sale_price DECIMAL,
+        purchase_price DECIMAL,
+        gross_amt DECIMAL,
+        disc_per DECIMAL,
+        discount DECIMAL,
+        tax_per DECIMAL,
+        tax_amt DECIMAL,
+        net_amt DECIMAL,
+        month_year DATE,
+        hash_id VARCHAR PRIMARY KEY
+    );
+    """)
+    with engine.connect() as conn:
+        conn.execute(create_new_table_query)
+
+def insert_data_to_postgres(**kwargs):
+    ti = kwargs['ti']
+    preprocessed_data_json = ti.xcom_pull(key='preprocessed_data', task_ids='preprocess_csv_data')
+    
+    # Read JSON string to DataFrame using StringIO to avoid FutureWarning
+    df = pd.read_json(StringIO(preprocessed_data_json))
+    
+    engine = get_database_connection()
+    bulk_insert_data_to_postgres(engine, df)
+
+def generate_hash_id(row):
+    hash_input = f"{row['Order No']}{row['Invoice No']}{row['Order Date']}{row['Vendor']}{row['Manufacturer']}{row['Item Name']}{row['Batch No']}{row['Expiry']}{row['Purchase Qty']}{row['Units']}{row['Avl. Qty']}{row['Units.1']}{row['Sale Price']}{row['Purchase Price']}{row['Gross Amt']}{row['Disc.Per']}{row['Discount']}{row['Tax %']}{row['Tax Amt']}{row['Net Amt']}{row['Month_Year']}"
+    return hashlib.sha256(hash_input.encode()).hexdigest()
+
+
+def get_database_connection():
+    config = ConfigParser()
+    config.read('/home/vishprospero/FinGPT/src/app/config.ini')  # Assuming config file is in the 'app' directory
+    db_config = config['database']
+
+    db_user = 'postgres'  # e.g. 'my-database-user'
+    db_pass = 'a55zWlt:CYtAi|FB(|jJSpRA90N}'  # e.g. 'my-database-password'
+    db_name = 'data-lake-table' #'fingpt-db-dev'  # e.g. 'my-database'
+    unix_socket_path = 'independent-way-410316:us-central1:collaborativedocsdb-test'
+    ip_type = IPTypes.PRIVATE if os.environ.get("PRIVATE_IP") else IPTypes.PUBLIC
+
+    # initialize Cloud SQL Python Connector object
+    connector = Connector()
+
+
+    def getconn() -> pg8000.dbapi.Connection:
+        conn: pg8000.dbapi.Connection = connector.connect(
+            unix_socket_path,
+            "pg8000",
+            user=db_user,
+            password=db_pass,
+            db=db_name,
+            ip_type=ip_type
+        )
+        return conn
+
+    pool = sqlalchemy.create_engine(
+        "postgresql+pg8000://",
+        creator=getconn,
+        pool_size=5,
+        max_overflow=2,
+        pool_timeout=30,  # 30 seconds
+        pool_recycle=1800  # 30 minutes
+    )
+    return pool
+
+# def bulk_insert_data_to_postgres(engine, df):
+#     records = []
+#     for index, row in df.iterrows():
+#         records.append({
+#             'order_no': row['Order No'],
+#             'invoice_no': row['Invoice No'],
+#             'order_date': row['Order Date'],
+#             'vendor': row['Vendor'],
+#             'manufacturer': row['Manufacturer'],
+#             'item_name': row['Item Name'],
+#             'batch_no': row['Batch No'],
+#             'expiry': row['Expiry'],
+#             'purchase_qty': row['Purchase Qty'],
+#             'units': row['Units'],
+#             'avl_qty': row['Avl. Qty'],
+#             'units_1': row['Units.1'],
+#             'sale_price': row['Sale Price'],
+#             'purchase_price': row['Purchase Price'],
+#             'gross_amt': row['Gross Amt'],
+#             'disc_per': row['Disc.Per'],
+#             'discount': row['Discount'],
+#             'tax_per': row['Tax %'],
+#             'tax_amt': row['Tax Amt'],
+#             'net_amt': row['Net Amt'],
+#             'month_year': row['Month_Year'],
+#             'hash_id': row['hash_id']
+#         })
+
+#     insert_query = text("""
+#         INSERT INTO updated_purchase (
+#             order_no, invoice_no, order_date, vendor, manufacturer, item_name, batch_no, expiry, purchase_qty, units, avl_qty, units_1, sale_price, purchase_price, gross_amt, disc_per, discount, tax_per, tax_amt, net_amt, month_year, hash_id
+#         ) VALUES (
+#             :order_no, :invoice_no, :order_date, :vendor, :manufacturer, :item_name, :batch_no, :expiry, :purchase_qty, :units, :avl_qty, :units_1, :sale_price, :purchase_price, :gross_amt, :disc_per, :discount, :tax_per, :tax_amt, :net_amt, :month_year, :hash_id
+#         ) ON CONFLICT (hash_id) DO NOTHING;
+#     """)
+
+#     batch_size = 1000
+#     with engine.connect() as conn:
+#         for i in range(0, len(records), batch_size):
+#             batch_records = records[i:i+batch_size]
+#             print(f"Inserting Rows {i} to {i+batch_size}")
+#             conn.execute(insert_query, batch_records)
+# Function to convert milliseconds to seconds
+def convert_milliseconds_to_seconds(ms):
+    return pd.to_datetime(ms, unit='ms')
+
+# Function to perform bulk insert to PostgreSQL
+def bulk_insert_data_to_postgres(engine, df):
+    # Convert relevant columns from milliseconds to seconds
+    df['order_date'] = convert_milliseconds_to_seconds(df['Order Date'])
+    df['expiry'] = convert_milliseconds_to_seconds(df['Expiry'])
+    df['month_year'] = convert_milliseconds_to_seconds(df['Month_Year'])
+
+    records = []
+    for index, row in df.iterrows():
+        records.append({
+            'order_no': row['Order No'],
+            'invoice_no': row['Invoice No'],
+            'order_date': row['order_date'],
+            'vendor': row['Vendor'],
+            'manufacturer': row['Manufacturer'],
+            'item_name': row['Item Name'],
+            'batch_no': row['Batch No'],
+            'expiry': row['expiry'],
+            'purchase_qty': row['Purchase Qty'],
+            'units': row['Units'],
+            'avl_qty': row['Avl. Qty'],
+            'units_1': row['Units.1'],
+            'sale_price': row['Sale Price'],
+            'purchase_price': row['Purchase Price'],
+            'gross_amt': row['Gross Amt'],
+            'disc_per': row['Disc.Per'],
+            'discount': row['Discount'],
+            'tax_per': row['Tax %'],
+            'tax_amt': row['Tax Amt'],
+            'net_amt': row['Net Amt'],
+            'month_year': row['month_year'],
+            'hash_id': row['hash_id']
+        })
+
+    insert_query = text("""
+        INSERT INTO updated_purchase (
+            order_no, invoice_no, order_date, vendor, manufacturer, item_name, batch_no, expiry, purchase_qty, units, avl_qty, units_1, sale_price, purchase_price, gross_amt, disc_per, discount, tax_per, tax_amt, net_amt, month_year, hash_id
+        ) VALUES (
+            :order_no, :invoice_no, :order_date, :vendor, :manufacturer, :item_name, :batch_no, :expiry, :purchase_qty, :units, :avl_qty, :units_1, :sale_price, :purchase_price, :gross_amt, :disc_per, :discount, :tax_per, :tax_amt, :net_amt, :month_year, :hash_id
+        ) ON CONFLICT (hash_id) DO NOTHING;
+    """)
+
+    batch_size = 1000
+    with engine.connect() as conn:
+        for i in range(0, len(records), batch_size):
+            batch_records = records[i:i+batch_size]
+            print(f"Inserting Rows {i} to {i+batch_size}")
+            conn.execute(insert_query, batch_records)
+# Define tasks
+read_csv_task = PythonOperator(
+    task_id='read_csv_file',
+    python_callable=read_csv_file,
+    provide_context=True,
+    dag=dag,
+)
+
+preprocess_csv_task = PythonOperator(
+    task_id='preprocess_csv_data',
+    python_callable=preprocess_csv_data,
+    provide_context=True,
+    dag=dag,
+)
+
+create_table_task = PythonOperator(
+    task_id='create_new_table',
+    python_callable=create_new_table,
+    provide_context=True,
+    dag=dag,
+)
+
+insert_data_task = PythonOperator(
+    task_id='insert_data_to_postgres',
+    python_callable=insert_data_to_postgres,
+    provide_context=True,
+    dag=dag,
+)
+
+# Define task dependencies
+read_csv_task >> preprocess_csv_task >> create_table_task >> insert_data_task
