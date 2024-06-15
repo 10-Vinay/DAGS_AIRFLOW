@@ -1,0 +1,195 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+import pandas as pd
+import os
+import glob
+import psycopg2
+import pytz
+import hashlib
+import sqlalchemy
+import pg8000
+from sqlalchemy import inspect, text
+from datetime import datetime, timedelta
+from configparser import ConfigParser
+from google.cloud.sql.connector import Connector, IPTypes
+from io import StringIO
+
+# Define the default arguments for the DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'start_date': days_ago(1),
+}
+
+# Define the DAG
+dag = DAG(
+    'Direct_Cost_csv_to_postgres',
+    default_args=default_args,
+    description='A DAG to process CSV data and upload to PostgreSQL',
+    schedule_interval='@daily',
+    catchup=False,
+)
+
+csv_file_pattern = "/home/vishprospero/Docchoice/Direct_Cost_Dag.csv"  # Update this path
+
+def read_csv_file(**kwargs):
+    files = glob.glob(csv_file_pattern)
+    df_list = []
+    for file in files:
+        print("Reading file:", file)
+        df = pd.read_csv(file)
+        df_list.append(df)
+    df = pd.concat(df_list)
+    
+    # Reset index to ensure uniqueness
+    df.reset_index(drop=True, inplace=True)
+    
+    # Convert DataFrame to JSON and push to XCom
+    csv_data_json = df.to_json()
+    kwargs['ti'].xcom_push(key='csv_data', value=csv_data_json)
+
+def preprocess_csv_data(**kwargs):
+    ti = kwargs['ti']
+    csv_data_json = ti.xcom_pull(key='csv_data', task_ids='read_csv_file')
+    
+    # Read JSON string to DataFrame using StringIO to avoid FutureWarning
+    df = pd.read_json(StringIO(csv_data_json))
+    
+    df['Date'] = pd.to_datetime(df['Date'])
+    
+    df['Amount'] = pd.to_numeric(df['Amount'].str.replace('-', '0').str.strip(), errors='coerce').fillna(0)
+
+    df['hash_id'] = df.apply(generate_hash_id, axis=1)
+
+    # Convert preprocessed DataFrame to JSON and push to XCom
+    preprocessed_data_json = df.to_json()
+    kwargs['ti'].xcom_push(key='preprocessed_data', value=preprocessed_data_json)
+
+def create_direct_cost_table(**kwargs):
+    engine = get_database_connection()
+    create_direct_cost_table_query = text("""
+    CREATE TABLE IF NOT EXISTS direct_cost_data (
+        date DATE,
+        ledger VARCHAR,
+        cost_centre VARCHAR,
+        description VARCHAR,
+        amount DECIMAL,
+        month_year VARCHAR,
+        hash_id VARCHAR PRIMARY KEY
+    );
+    """)
+    with engine.connect() as conn:
+        conn.execute(create_direct_cost_table_query)
+
+def insert_data_to_postgres(**kwargs):
+    ti = kwargs['ti']
+    preprocessed_data_json = ti.xcom_pull(key='preprocessed_data', task_ids='preprocess_csv_data')
+    
+    # Read JSON string to DataFrame using StringIO to avoid FutureWarning
+    df = pd.read_json(StringIO(preprocessed_data_json))
+    
+    engine = get_database_connection()
+    bulk_insert_data_to_postgres(engine, df)
+
+def generate_hash_id(row):
+    hash_input = f"{row['Date']}{row['Ledger']}{row['Cost Centre']}{row['Description']}{row['Amount']}{row['month_year']}"
+    return hashlib.sha256(hash_input.encode()).hexdigest()
+
+def get_database_connection():
+    config = ConfigParser()
+    config.read('/home/vishprospero/FinGPT/src/app/config.ini')  # Assuming config file is in the 'app' directory
+    db_config = config['database']
+
+    db_user = 'postgres'  # e.g. 'my-database-user'
+    db_pass = 'a55zWlt:CYtAi|FB(|jJSpRA90N}'  # e.g. 'my-database-password'
+    db_name = 'data-lake-table' #'fingpt-db-dev'  # e.g. 'my-database'
+    unix_socket_path = 'independent-way-410316:us-central1:collaborativedocsdb-test' 
+    ip_type = IPTypes.PRIVATE if os.environ.get("PRIVATE_IP") else IPTypes.PUBLIC
+
+    # initialize Cloud SQL Python Connector object
+    connector = Connector()
+
+    def getconn() -> pg8000.dbapi.Connection:
+        conn: pg8000.dbapi.Connection = connector.connect(
+            unix_socket_path,
+            "pg8000",
+            user=db_user,
+            password=db_pass,
+            db=db_name,
+            ip_type=ip_type
+        )
+        return conn
+
+    pool = sqlalchemy.create_engine(
+        "postgresql+pg8000://",
+        creator=getconn,
+        pool_size=5,
+        max_overflow=2,
+        pool_timeout=30,  # 30 seconds
+        pool_recycle=1800  # 30 minutes
+    )
+    return pool
+
+def bulk_insert_data_to_postgres(engine, df):
+    records = []
+    current_timestamp_iso = datetime.utcnow().isoformat()
+    for index, row in df.iterrows():
+        records.append({
+            'date': row['Date'],
+            'ledger': row['Ledger'],
+            'cost_centre': row['Cost Centre'],
+            'description': row['Description'],
+            'amount': row['Amount'],
+            'month_year': row['month_year'],
+            'hash_id': row['hash_id']
+        })
+
+    insert_query = text("""
+        INSERT INTO Direct_Cost_data (
+            date, ledger, cost_centre, description, amount, month_year, hash_id
+        ) VALUES (
+            :date, :ledger, :cost_centre, :description, :amount, :month_year, :hash_id
+        ) ON CONFLICT (hash_id) DO NOTHING;
+    """)
+
+    batch_size = 1000
+    with engine.connect() as conn:
+        for i in range(0, len(records), batch_size):
+            batch_records = records[i:i+batch_size]
+            print(f"Inserting Rows {i} to {i+batch_size}")
+            conn.execute(insert_query, batch_records)
+
+read_csv_task = PythonOperator(
+    task_id='read_csv_file',
+    python_callable=read_csv_file,
+    provide_context=True,
+    dag=dag,
+)
+
+preprocess_csv_task = PythonOperator(
+    task_id='preprocess_csv_data',
+    python_callable=preprocess_csv_data,
+    provide_context=True,
+    dag=dag,
+)
+
+create_table_task = PythonOperator(
+    task_id='create_direct_cost_table',
+    python_callable=create_direct_cost_table,
+    provide_context=True,
+    dag=dag,
+)
+
+insert_data_task = PythonOperator(
+    task_id='insert_data_to_postgres',
+    python_callable=insert_data_to_postgres,
+    provide_context=True,
+    dag=dag,
+)
+
+read_csv_task >> preprocess_csv_task >> create_table_task >> insert_data_task
